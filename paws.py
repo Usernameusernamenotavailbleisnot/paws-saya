@@ -66,14 +66,10 @@ class PawsAutomation:
                 "tasks": False,
                 "referral_code": "ss0WegUb",
                 "blacklisted_tasks": [
-                    "6730b42d74fd6bd0dd6904c1",
-                    "6730b44974fd6bd0dd6904c3",
-                    "6730b45874fd6bd0dd6904c5",
-                    "6730b47b74fd6bd0dd6904c7",
-                    "6714e8b80f93ce482efae727",
+                    "6740b2cb15bd1d26b7b71266",
                     "6727ca831ee144b53eb8c08c",
-                    "673e136d3865e40ecf62e168",
-                    "671b8ecb22d15820f13dc61a"
+                    "671b8ecb22d15820f13dc61a",
+                    "6714e8b80f93ce482efae727"
                 ]
             }
             self.save_config()
