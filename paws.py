@@ -69,6 +69,7 @@ class PawsAutomation:
                     "6740b2cb15bd1d26b7b71266",
                     "6727ca831ee144b53eb8c08c",
                     "671b8ecb22d15820f13dc61a",
+                    "671b8ee422d15820f13dc61d",
                     "6714e8b80f93ce482efae727"
                 ]
             }
