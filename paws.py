@@ -1,3 +1,4 @@
+import cloudscraper
 import requests
 import json
 import time
@@ -16,6 +17,23 @@ from colorama import init, Fore, Style
 # Initialize colorama for cross-platform colored output
 init()
 
+# Default headers for all requests
+DEFAULT_HEADERS = {
+    'accept': 'application/json',
+    'accept-language': 'en-US,en;q=0.9',
+    'content-type': 'application/json',
+    'origin': 'https://app.paws.community',
+    'priority': 'u=1, i',
+    'referer': 'https://app.paws.community/',
+    'sec-ch-ua': '"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24", "Microsoft Edge WebView2";v="131"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'same-site',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0'
+}
+
 class Logger:
     def __init__(self, lock):
         self.lock = lock
@@ -24,7 +42,6 @@ class Logger:
         with self.lock:
             current_time = datetime.now().strftime("%H:%M:%S")
             
-            # Color mapping
             colors = {
                 "SUCCESS": Fore.GREEN,
                 "ERROR": Fore.RED,
@@ -34,12 +51,8 @@ class Logger:
             }
             
             color = colors.get(level, Fore.WHITE)
-            
-            # Format the log message
             log_message = f"[{current_time}] [{level}] [{username}@{ip}] {message}"
             colored_message = f"{color}{log_message}{Style.RESET_ALL}"
-            
-            # Print to console with color
             print(colored_message)
 
 class PawsAutomation:
@@ -69,7 +82,6 @@ class PawsAutomation:
                     "6740b2cb15bd1d26b7b71266",
                     "6727ca831ee144b53eb8c08c",
                     "671b8ecb22d15820f13dc61a",
-                    "671b8ee422d15820f13dc61d",
                     "6714e8b80f93ce482efae727"
                 ]
             }
@@ -130,6 +142,19 @@ class PawsAutomation:
                 'https': proxy.replace('http://', 'https://')
             }
 
+    def create_scraper_session(self, proxy=None):
+        scraper = cloudscraper.create_scraper(
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'mobile': False
+            }
+        )
+        if proxy:
+            scraper.proxies = proxy
+        scraper.headers.update(DEFAULT_HEADERS)
+        return scraper
+
     def check_ip(self, session):
         try:
             response = session.get('https://ipinfo.io/json')
@@ -154,15 +179,9 @@ class PawsAutomation:
                 "referralCode": self.config['referral_code']
             }
             
-            headers = {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            }
-            
             response = session.post(
                 f"{self.base_url}/user/auth",
-                json=payload,
-                headers=headers
+                json=payload
             )
             
             if response.status_code == 201:
@@ -179,58 +198,57 @@ class PawsAutomation:
             return None
 
     def process_tasks(self, session, username, current_ip):
-            if not self.config['tasks']:
+        if not self.config['tasks']:
+            return
+
+        try:
+            response = session.get(f"{self.base_url}/quests/list")
+            
+            if response.status_code != 200:
+                self.logger.log(f"Failed to fetch tasks. Status code: {response.status_code}", "ERROR", username, current_ip)
                 return
 
-            try:
-                response = session.get(f"{self.base_url}/quests/list")
-                
-                if response.status_code != 200:
-                    self.logger.log(f"Failed to fetch tasks. Status code: {response.status_code}", "ERROR", username, current_ip)
-                    return
+            tasks = response.json()['data']
+            completed_count = 0
 
-                tasks = response.json()['data']
-                completed_count = 0
+            for task in tasks:
+                if task['_id'] in self.config['blacklisted_tasks']:
+                    self.logger.log(f"Skipping blacklisted task: {task['title']}", "INFO", username, current_ip)
+                    continue
 
-                for task in tasks:
-                    # Skip if task is in blacklist
-                    if task['_id'] in self.config['blacklisted_tasks']:
-                        self.logger.log(f"Skipping blacklisted task: {task['title']}", "INFO", username, current_ip)
-                        continue
+                if task['progress']['claimed']:
+                    continue
 
-                    if task['progress']['claimed']:
-                        continue
+                try:
+                    complete_response = session.post(
+                        f"{self.base_url}/quests/completed",
+                        json={"questId": task['_id']}
+                    )
 
-                    try:
-                        complete_response = session.post(
-                            f"{self.base_url}/quests/completed",
+                    if complete_response.status_code == 201:
+                        claim_response = session.post(
+                            f"{self.base_url}/quests/claim",
                             json={"questId": task['_id']}
                         )
 
-                        if complete_response.status_code == 201:
-                            claim_response = session.post(
-                                f"{self.base_url}/quests/claim",
-                                json={"questId": task['_id']}
-                            )
-
-                            if claim_response.status_code == 201:
-                                completed_count += 1
-                                self.logger.log(f"Task completed and claimed: {task['title']}", "SUCCESS", username, current_ip)
-                            else:
-                                self.logger.log(f"Failed to claim task. Status: {claim_response.status_code}", "ERROR", username, current_ip)
+                        if claim_response.status_code == 201:
+                            completed_count += 1
+                            self.logger.log(f"Task completed and claimed: {task['title']}", "SUCCESS", username, current_ip)
                         else:
-                            self.logger.log(f"Failed to complete task. Status: {complete_response.status_code}", "ERROR", username, current_ip)
+                            self.logger.log(f"Failed to claim task. Status: {claim_response.status_code}", "ERROR", username, current_ip)
+                    else:
+                        self.logger.log(f"Failed to complete task. Status: {complete_response.status_code}", "ERROR", username, current_ip)
 
-                        time.sleep(random.uniform(self.config['delay']['min'], self.config['delay']['max']))
+                    time.sleep(random.uniform(self.config['delay']['min'], self.config['delay']['max']))
 
-                    except Exception as e:
-                        self.logger.log(f"Error processing task {task['_id']}: {str(e)}", "ERROR", username, current_ip)
+                except Exception as e:
+                    self.logger.log(f"Error processing task {task['_id']}: {str(e)}", "ERROR", username, current_ip)
 
-                if completed_count > 0:
-                    self.logger.log(f"Completed {completed_count} tasks", "SUCCESS", username, current_ip)
+            if completed_count > 0:
+                self.logger.log(f"Completed {completed_count} tasks", "SUCCESS", username, current_ip)
 
-            except Exception as e:
-                self.logger.log(f"Task processing error: {str(e)}", "ERROR", username, current_ip)
+        except Exception as e:
+            self.logger.log(f"Task processing error: {str(e)}", "ERROR", username, current_ip)
 
     def check_account_status(self, session, username, current_ip):
         try:
@@ -246,16 +264,15 @@ class PawsAutomation:
             self.logger.log(f"Error checking account status: {str(e)}", "ERROR", username, current_ip)
 
     def process_account(self, query_text):
-        session = requests.Session()
         current_ip = 'unknown'
         username = "unknown"
 
         try:
-            if self.config['use_proxy']:
-                proxy = self.get_proxy()
-                if proxy:
-                    session.proxies = proxy
-                    current_ip = self.check_ip(session)
+            proxy = self.get_proxy() if self.config['use_proxy'] else None
+            session = self.create_scraper_session(proxy)
+
+            if proxy:
+                current_ip = self.check_ip(session)
 
             # Parse user data
             params = dict(urllib.parse.parse_qsl(query_text))
@@ -286,8 +303,6 @@ class PawsAutomation:
 
         except Exception as e:
             self.logger.log(f"Critical error: {str(e)}", "ERROR", username, current_ip)
-        finally:
-            session.close()
 
 def main():
     bot = PawsAutomation()
