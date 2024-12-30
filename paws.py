@@ -19,7 +19,6 @@ init()
 # Default headers for all requests
 DEFAULT_HEADERS = {
     'accept': 'application/json',
-    'accept-encoding': 'gzip, deflate, br, zstd',
     'accept-language': 'en-US,en;q=0.9',
     'content-type': 'application/json',
     'origin': 'https://app.paws.community',
