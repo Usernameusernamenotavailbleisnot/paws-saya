@@ -1,4 +1,3 @@
-import cloudscraper
 import requests
 import json
 import time
@@ -20,6 +19,7 @@ init()
 # Default headers for all requests
 DEFAULT_HEADERS = {
     'accept': 'application/json',
+    'accept-encoding': 'gzip, deflate, br, zstd',
     'accept-language': 'en-US,en;q=0.9',
     'content-type': 'application/json',
     'origin': 'https://app.paws.community',
@@ -42,6 +42,7 @@ class Logger:
         with self.lock:
             current_time = datetime.now().strftime("%H:%M:%S")
             
+            # Color mapping
             colors = {
                 "SUCCESS": Fore.GREEN,
                 "ERROR": Fore.RED,
@@ -51,8 +52,12 @@ class Logger:
             }
             
             color = colors.get(level, Fore.WHITE)
+            
+            # Format the log message
             log_message = f"[{current_time}] [{level}] [{username}@{ip}] {message}"
             colored_message = f"{color}{log_message}{Style.RESET_ALL}"
+            
+            # Print to console with color
             print(colored_message)
 
 class PawsAutomation:
@@ -142,22 +147,9 @@ class PawsAutomation:
                 'https': proxy.replace('http://', 'https://')
             }
 
-    def create_scraper_session(self, proxy=None):
-        scraper = cloudscraper.create_scraper(
-            browser={
-                'browser': 'chrome',
-                'platform': 'windows',
-                'mobile': False
-            }
-        )
-        if proxy:
-            scraper.proxies = proxy
-        scraper.headers.update(DEFAULT_HEADERS)
-        return scraper
-
     def check_ip(self, session):
         try:
-            response = session.get('https://ipinfo.io/json')
+            response = session.get('https://ipinfo.io/json', headers=DEFAULT_HEADERS)
             if response.status_code == 200:
                 data = response.json()
                 return data.get('ip', 'Unknown')
@@ -166,7 +158,7 @@ class PawsAutomation:
 
     def validate_token(self, session, username, current_ip):
         try:
-            response = session.get(f"{self.base_url}/user")
+            response = session.get(f"{self.base_url}/user", headers=DEFAULT_HEADERS)
             return response.status_code == 200
         except Exception as e:
             self.logger.log(f"Token validation failed: {str(e)}", "ERROR", username, current_ip)
@@ -179,9 +171,12 @@ class PawsAutomation:
                 "referralCode": self.config['referral_code']
             }
             
+            headers = DEFAULT_HEADERS.copy()
+            
             response = session.post(
                 f"{self.base_url}/user/auth",
-                json=payload
+                json=payload,
+                headers=headers
             )
             
             if response.status_code == 201:
@@ -198,81 +193,85 @@ class PawsAutomation:
             return None
 
     def process_tasks(self, session, username, current_ip):
-        if not self.config['tasks']:
-            return
-
-        try:
-            response = session.get(f"{self.base_url}/quests/list")
-            
-            if response.status_code != 200:
-                self.logger.log(f"Failed to fetch tasks. Status code: {response.status_code}", "ERROR", username, current_ip)
+            if not self.config['tasks']:
                 return
 
-            tasks = response.json()['data']
-            completed_count = 0
+            try:
+                response = session.get(f"{self.base_url}/quests/list?type=christmas", headers=DEFAULT_HEADERS)
+                
+                if response.status_code != 200:
+                    self.logger.log(f"Failed to fetch tasks. Status code: {response.status_code}", "ERROR", username, current_ip)
+                    return
 
-            for task in tasks:
-                if task['_id'] in self.config['blacklisted_tasks']:
-                    self.logger.log(f"Skipping blacklisted task: {task['title']}", "INFO", username, current_ip)
-                    continue
+                tasks = response.json()['data']
+                completed_count = 0
 
-                if task['progress']['claimed']:
-                    continue
+                for task in tasks:
+                    # Skip if task is in blacklist
+                    if task['_id'] in self.config['blacklisted_tasks']:
+                        self.logger.log(f"Skipping blacklisted task: {task['title']}", "INFO", username, current_ip)
+                        continue
 
-                try:
-                    complete_response = session.post(
-                        f"{self.base_url}/quests/completed",
-                        json={"questId": task['_id']}
-                    )
+                    if task['progress']['claimed']:
+                        continue
 
-                    if complete_response.status_code == 201:
-                        claim_response = session.post(
-                            f"{self.base_url}/quests/claim",
-                            json={"questId": task['_id']}
+                    try:
+                        complete_response = session.post(
+                            f"{self.base_url}/quests/completed",
+                            json={"questId": task['_id']},
+                            headers=DEFAULT_HEADERS
                         )
 
-                        if claim_response.status_code == 201:
-                            completed_count += 1
-                            self.logger.log(f"Task completed and claimed: {task['title']}", "SUCCESS", username, current_ip)
+                        if complete_response.status_code == 201:
+                            claim_response = session.post(
+                                f"{self.base_url}/quests/claim",
+                                json={"questId": task['_id']},
+                                headers=DEFAULT_HEADERS
+                            )
+
+                            if claim_response.status_code == 201:
+                                completed_count += 1
+                                self.logger.log(f"Task completed and claimed: {task['title']}", "SUCCESS", username, current_ip)
+                            else:
+                                self.logger.log(f"Failed to claim task. Status: {claim_response.status_code}", "ERROR", username, current_ip)
                         else:
-                            self.logger.log(f"Failed to claim task. Status: {claim_response.status_code}", "ERROR", username, current_ip)
-                    else:
-                        self.logger.log(f"Failed to complete task. Status: {complete_response.status_code}", "ERROR", username, current_ip)
+                            self.logger.log(f"Failed to complete task. Status: {complete_response.status_code}", "ERROR", username, current_ip)
 
-                    time.sleep(random.uniform(self.config['delay']['min'], self.config['delay']['max']))
+                        time.sleep(random.uniform(self.config['delay']['min'], self.config['delay']['max']))
 
-                except Exception as e:
-                    self.logger.log(f"Error processing task {task['_id']}: {str(e)}", "ERROR", username, current_ip)
+                    except Exception as e:
+                        self.logger.log(f"Error processing task {task['_id']}: {str(e)}", "ERROR", username, current_ip)
 
-            if completed_count > 0:
-                self.logger.log(f"Completed {completed_count} tasks", "SUCCESS", username, current_ip)
+                if completed_count > 0:
+                    self.logger.log(f"Completed {completed_count} tasks", "SUCCESS", username, current_ip)
 
-        except Exception as e:
-            self.logger.log(f"Task processing error: {str(e)}", "ERROR", username, current_ip)
+            except Exception as e:
+                self.logger.log(f"Task processing error: {str(e)}", "ERROR", username, current_ip)
 
     def check_account_status(self, session, username, current_ip):
         try:
-            response = session.get(f"{self.base_url}/user")
+            response = session.get(f"{self.base_url}/user", headers=DEFAULT_HEADERS)
             if response.status_code == 200:
                 user_data = response.json()['data']
-                claim_date = datetime.fromtimestamp(user_data['claimStreakData']['lastClaimDate']/1000).strftime('%Y-%m-%d %H:%M:%S')
-                balance = user_data['gameData']['balance']
-                self.logger.log(f"Balance: {balance} | Last Claim: {claim_date}", "SUCCESS", username, current_ip)
+                ##claim_date = datetime.fromtimestamp(user_data['claimStreakData']['lastClaimDate']/1000).strftime('%Y-%m-%d %H:%M:%S')
+                ##balance = user_data['gameData']['balance']
+                ##self.logger.log(f"Balance: {balance} | Last Claim: {claim_date}", "SUCCESS", username, current_ip)
             else:
                 self.logger.log(f"Failed to get account status: {response.text}", "ERROR", username, current_ip)
         except Exception as e:
             self.logger.log(f"Error checking account status: {str(e)}", "ERROR", username, current_ip)
 
     def process_account(self, query_text):
+        session = requests.Session()
         current_ip = 'unknown'
         username = "unknown"
 
         try:
-            proxy = self.get_proxy() if self.config['use_proxy'] else None
-            session = self.create_scraper_session(proxy)
-
-            if proxy:
-                current_ip = self.check_ip(session)
+            if self.config['use_proxy']:
+                proxy = self.get_proxy()
+                if proxy:
+                    session.proxies = proxy
+                    current_ip = self.check_ip(session)
 
             # Parse user data
             params = dict(urllib.parse.parse_qsl(query_text))
@@ -303,6 +302,8 @@ class PawsAutomation:
 
         except Exception as e:
             self.logger.log(f"Critical error: {str(e)}", "ERROR", username, current_ip)
+        finally:
+            session.close()
 
 def main():
     bot = PawsAutomation()
