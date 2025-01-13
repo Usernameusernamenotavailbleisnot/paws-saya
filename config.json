@@ -1,14 +1,13 @@
 {
-    "use_proxy": false,
+    "use_proxy": true,
     "threads": 1,
     "delay": {
         "min": 2,
         "max": 5
     },
     "tasks": true,
-    "referral_code": "ss0WegUb",
+    "referral_code": "",
     "blacklisted_tasks": [
-        "6740b2cb15bd1d26b7b71266",
         "6727ca831ee144b53eb8c08c",
         "671b8ecb22d15820f13dc61a",
         "6714e8b80f93ce482efae727"
