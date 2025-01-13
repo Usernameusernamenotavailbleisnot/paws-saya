@@ -196,7 +196,7 @@ class PawsAutomation:
                 return
 
             try:
-                response = session.get(f"{self.base_url}/quests/list?type=christmas", headers=DEFAULT_HEADERS)
+                response = session.get(f"{self.base_url}/quests/list", headers=DEFAULT_HEADERS)
                 
                 if response.status_code != 200:
                     self.logger.log(f"Failed to fetch tasks. Status code: {response.status_code}", "ERROR", username, current_ip)
