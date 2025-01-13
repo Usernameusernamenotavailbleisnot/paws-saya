@@ -7,7 +7,7 @@ import random
 import threading
 from queue import Queue
 import urllib.parse
-from requests.exceptions import RequestException
+from requests.exceptions import RequestException, ProxyError, ConnectTimeout, ReadTimeout
 from time import sleep
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -41,7 +41,6 @@ class Logger:
         with self.lock:
             current_time = datetime.now().strftime("%H:%M:%S")
             
-            # Color mapping
             colors = {
                 "SUCCESS": Fore.GREEN,
                 "ERROR": Fore.RED,
@@ -51,12 +50,8 @@ class Logger:
             }
             
             color = colors.get(level, Fore.WHITE)
-            
-            # Format the log message
             log_message = f"[{current_time}] [{level}] [{username}@{ip}] {message}"
             colored_message = f"{color}{log_message}{Style.RESET_ALL}"
-            
-            # Print to console with color
             print(colored_message)
 
 class PawsAutomation:
@@ -66,6 +61,7 @@ class PawsAutomation:
         self.load_config()
         self.base_url = "https://api.paws.community/v1"
         self.proxies = self.load_proxies() if self.config['use_proxy'] else []
+        self.proxy_timeout = 10
 
     def load_config(self):
         try:
@@ -133,6 +129,16 @@ class PawsAutomation:
             return None
         proxy = random.choice(self.proxies)
         
+        proxy = proxy.strip()
+        if not proxy:
+            return None
+            
+        if '@' in proxy:
+            return {
+                'http': proxy,
+                'https': proxy
+            }
+        
         if proxy.startswith('socks4://') or proxy.startswith('socks5://'):
             return {
                 'http': proxy,
@@ -146,18 +152,94 @@ class PawsAutomation:
                 'https': proxy.replace('http://', 'https://')
             }
 
-    def check_ip(self, session):
-        try:
-            response = session.get('https://ipinfo.io/json', headers=DEFAULT_HEADERS)
-            if response.status_code == 200:
-                data = response.json()
-                return data.get('ip', 'Unknown')
-        except Exception:
-            return 'Error'
+    def create_session_with_proxy(self):
+        session = requests.Session()
+        
+        if self.config['use_proxy']:
+            max_retries = 3
+            used_proxies = set()  # Track used proxies
+            
+            while len(used_proxies) < len(self.proxies) and len(used_proxies) < max_retries:
+                try:
+                    # Get a proxy that hasn't been tried yet
+                    available_proxies = [p for p in self.proxies if p not in used_proxies]
+                    if not available_proxies:
+                        break
+                        
+                    proxy = random.choice(available_proxies)
+                    used_proxies.add(proxy)
+                    
+                    proxy_config = self.get_proxy()
+                    if proxy_config:
+                        session.proxies = proxy_config
+                        response = session.get('https://ipinfo.io/json', 
+                                            timeout=self.proxy_timeout,
+                                            headers=DEFAULT_HEADERS)
+                        if response.status_code == 200:
+                            return session, response.json().get('ip', 'Unknown')
+                except (ProxyError, ConnectTimeout, ReadTimeout, ConnectionResetError, ConnectionError) as e:
+                    self.logger.log(f"Proxy {proxy} error: {str(e)}", "WARNING")
+                    continue  # Try next proxy
+                except Exception as e:
+                    self.logger.log(f"Unexpected error with proxy {proxy}: {str(e)}", "ERROR")
+                    continue  # Try next proxy
+                    
+            # If all retries failed with all available proxies
+            if self.proxies:
+                self.logger.log("All proxy attempts failed, retrying with random proxy", "WARNING")
+                # Force use random proxy even if previous attempts failed
+                proxy = random.choice(self.proxies)
+                proxy_config = self.get_proxy()
+                if proxy_config:
+                    session.proxies = proxy_config
+                    return session, proxy.split('@')[-1].split(':')[0] if '@' in proxy else proxy.split(':')[0]
+                
+        return session, 'No proxy'
+
+    def make_request_with_retry(self, session, method, url, **kwargs):
+        max_retries = 3
+        retry_delay = 1
+        last_exception = None
+
+        for attempt in range(max_retries):
+            try:
+                if 'timeout' not in kwargs:
+                    kwargs['timeout'] = self.proxy_timeout
+                    
+                response = getattr(session, method)(url, **kwargs)
+                return response
+                
+            except (requests.exceptions.RequestException,
+                    ConnectionResetError,
+                    ConnectionError,
+                    ConnectionAbortedError,
+                    ConnectionRefusedError) as e:
+                last_exception = e
+                self.logger.log(
+                    f"Request failed (attempt {attempt + 1}/{max_retries}): {str(e)}", 
+                    "WARNING"
+                )
+                
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (attempt + 1))
+                    
+                    if self.config['use_proxy']:
+                        proxy = self.get_proxy()
+                        if proxy:
+                            session.proxies = proxy
+                    continue
+                break
+
+        raise last_exception
 
     def validate_token(self, session, username, current_ip):
         try:
-            response = session.get(f"{self.base_url}/user", headers=DEFAULT_HEADERS)
+            response = self.make_request_with_retry(
+                session,
+                'get',
+                f"{self.base_url}/user",
+                headers=DEFAULT_HEADERS
+            )
             return response.status_code == 200
         except Exception as e:
             self.logger.log(f"Token validation failed: {str(e)}", "ERROR", username, current_ip)
@@ -170,12 +252,12 @@ class PawsAutomation:
                 "referralCode": self.config['referral_code']
             }
             
-            headers = DEFAULT_HEADERS.copy()
-            
-            response = session.post(
+            response = self.make_request_with_retry(
+                session,
+                'post',
                 f"{self.base_url}/user/auth",
                 json=payload,
-                headers=headers
+                headers=DEFAULT_HEADERS
             )
             
             if response.status_code == 201:
@@ -192,92 +274,99 @@ class PawsAutomation:
             return None
 
     def process_tasks(self, session, username, current_ip):
-            if not self.config['tasks']:
+        if not self.config['tasks']:
+            return
+
+        try:
+            response = self.make_request_with_retry(
+                session, 
+                'get',
+                f"{self.base_url}/quests/list",
+                headers=DEFAULT_HEADERS
+            )
+            
+            if response.status_code != 200:
+                self.logger.log(f"Failed to fetch tasks. Status code: {response.status_code}", "ERROR", username, current_ip)
                 return
 
-            try:
-                response = session.get(f"{self.base_url}/quests/list", headers=DEFAULT_HEADERS)
-                
-                if response.status_code != 200:
-                    self.logger.log(f"Failed to fetch tasks. Status code: {response.status_code}", "ERROR", username, current_ip)
-                    return
+            tasks = response.json()['data']
+            completed_count = 0
 
-                tasks = response.json()['data']
-                completed_count = 0
+            for task in tasks:
+                if task['_id'] in self.config['blacklisted_tasks']:
+                    self.logger.log(f"Skipping blacklisted task: {task['title']}", "INFO", username, current_ip)
+                    continue
 
-                for task in tasks:
-                    # Skip if task is in blacklist
-                    if task['_id'] in self.config['blacklisted_tasks']:
-                        self.logger.log(f"Skipping blacklisted task: {task['title']}", "INFO", username, current_ip)
-                        continue
+                if task['progress']['claimed']:
+                    continue
 
-                    if task['progress']['claimed']:
-                        continue
+                try:
+                    complete_response = self.make_request_with_retry(
+                        session,
+                        'post',
+                        f"{self.base_url}/quests/completed",
+                        json={"questId": task['_id']},
+                        headers=DEFAULT_HEADERS
+                    )
 
-                    try:
-                        complete_response = session.post(
-                            f"{self.base_url}/quests/completed",
+                    if complete_response.status_code == 201:
+                        claim_response = self.make_request_with_retry(
+                            session,
+                            'post',
+                            f"{self.base_url}/quests/claim",
                             json={"questId": task['_id']},
                             headers=DEFAULT_HEADERS
                         )
 
-                        if complete_response.status_code == 201:
-                            claim_response = session.post(
-                                f"{self.base_url}/quests/claim",
-                                json={"questId": task['_id']},
-                                headers=DEFAULT_HEADERS
-                            )
-
-                            if claim_response.status_code == 201:
-                                completed_count += 1
-                                self.logger.log(f"Task completed and claimed: {task['title']}", "SUCCESS", username, current_ip)
-                            else:
-                                self.logger.log(f"Failed to claim task. Status: {claim_response.status_code}", "ERROR", username, current_ip)
+                        if claim_response.status_code == 201:
+                            completed_count += 1
+                            self.logger.log(f"Task completed and claimed: {task['title']}", "SUCCESS", username, current_ip)
                         else:
-                            self.logger.log(f"Failed to complete task. Status: {complete_response.status_code}", "ERROR", username, current_ip)
+                            self.logger.log(f"Failed to claim task. Status: {claim_response.status_code}", "ERROR", username, current_ip)
+                    else:
+                        self.logger.log(f"Failed to complete task. Status: {complete_response.status_code}", "ERROR", username, current_ip)
 
-                        time.sleep(random.uniform(self.config['delay']['min'], self.config['delay']['max']))
+                    time.sleep(random.uniform(self.config['delay']['min'], self.config['delay']['max']))
 
-                    except Exception as e:
-                        self.logger.log(f"Error processing task {task['_id']}: {str(e)}", "ERROR", username, current_ip)
+                except Exception as e:
+                    self.logger.log(f"Error processing task {task['_id']}: {str(e)}", "ERROR", username, current_ip)
 
-                if completed_count > 0:
-                    self.logger.log(f"Completed {completed_count} tasks", "SUCCESS", username, current_ip)
+            if completed_count > 0:
+                self.logger.log(f"Completed {completed_count} tasks", "SUCCESS", username, current_ip)
 
-            except Exception as e:
-                self.logger.log(f"Task processing error: {str(e)}", "ERROR", username, current_ip)
+        except Exception as e:
+            self.logger.log(f"Task processing error: {str(e)}", "ERROR", username, current_ip)
 
     def check_account_status(self, session, username, current_ip):
         try:
-            response = session.get(f"{self.base_url}/user", headers=DEFAULT_HEADERS)
+            response = self.make_request_with_retry(
+                session,
+                'get',
+                f"{self.base_url}/user",
+                headers=DEFAULT_HEADERS
+            )
             if response.status_code == 200:
                 user_data = response.json()['data']
-                ##claim_date = datetime.fromtimestamp(user_data['claimStreakData']['lastClaimDate']/1000).strftime('%Y-%m-%d %H:%M:%S')
-                ##balance = user_data['gameData']['balance']
-                ##self.logger.log(f"Balance: {balance} | Last Claim: {claim_date}", "SUCCESS", username, current_ip)
+                # Uncomment if you want to show balance and claim date
+                # claim_date = datetime.fromtimestamp(user_data['claimStreakData']['lastClaimDate']/1000).strftime('%Y-%m-%d %H:%M:%S')
+                # balance = user_data['gameData']['balance']
+                # self.logger.log(f"Balance: {balance} | Last Claim: {claim_date}", "SUCCESS", username, current_ip)
             else:
                 self.logger.log(f"Failed to get account status: {response.text}", "ERROR", username, current_ip)
         except Exception as e:
             self.logger.log(f"Error checking account status: {str(e)}", "ERROR", username, current_ip)
 
     def process_account(self, query_text):
-        session = requests.Session()
-        current_ip = 'unknown'
+        session, current_ip = self.create_session_with_proxy()
         username = "unknown"
 
         try:
-            if self.config['use_proxy']:
-                proxy = self.get_proxy()
-                if proxy:
-                    session.proxies = proxy
-                    current_ip = self.check_ip(session)
-
-            # Parse user data
             params = dict(urllib.parse.parse_qsl(query_text))
             user_data = json.loads(urllib.parse.unquote(params['user']))
             username = user_data.get('username', 'unknown')
+            
+            self.logger.log(f"Processing account using IP: {current_ip}", "INFO", username, current_ip)
 
-            # Authentication
             tokens = self.load_tokens()
             
             if username in tokens:
@@ -295,12 +384,12 @@ class PawsAutomation:
                 else:
                     return
 
-            # Check account status and process tasks
             self.check_account_status(session, username, current_ip)
             self.process_tasks(session, username, current_ip)
 
         except Exception as e:
             self.logger.log(f"Critical error: {str(e)}", "ERROR", username, current_ip)
+            traceback.print_exc()
         finally:
             session.close()
 
