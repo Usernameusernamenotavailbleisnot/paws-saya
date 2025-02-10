@@ -3,11 +3,11 @@ import aiohttp
 import logging
 import concurrent.futures
 from random import uniform, choice
-from twocaptcha import TwoCaptcha
 from typing import Optional, List
 from concurrent.futures import ThreadPoolExecutor
 import time
 import os
+import json
 
 # Configure logging
 logging.basicConfig(
@@ -17,6 +17,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 API_ENDPOINT = "https://api.paws.community/v1"
+CAPSOLVER_API_ENDPOINT = "https://api.capsolver.com"
 
 # Define retryable errors
 PROXY_RETRY_ERRORS = [
@@ -32,9 +33,9 @@ PROXY_RETRY_ERRORS = [
 ]
 
 class PawsService:
-    def __init__(self, session_name: str, captcha_api_key: str, proxy: str, max_retries: int = 3):
+    def __init__(self, session_name: str, capsolver_api_key: str, proxy: str, max_retries: int = 3):
         self.session_name = session_name
-        self.captcha_api_key = captcha_api_key
+        self.capsolver_api_key = capsolver_api_key
         self.proxy = proxy
         self.max_retries = max_retries
         
@@ -77,43 +78,58 @@ class PawsService:
         return any(retry_err.lower() in error_str for retry_err in PROXY_RETRY_ERRORS)
 
     async def solve_captcha(self) -> dict:
-        solver = TwoCaptcha(self.captcha_api_key)
-        
-        for i in range(5):
-            try:
-                balance = solver.balance()
-                if balance > 0.1:
-                    logger.info(self.log_message(f'2Captcha Balance: {solver.balance()}'))
-                else:
-                    logger.warning(self.log_message(f'2Captcha Balance is too low: {balance}'))
+        """Solve captcha using Capsolver"""
+        try:
+            # Prepare the task for Capsolver
+            task_payload = {
+                "clientKey": self.capsolver_api_key,
+                "task": {
+                    "type": "ReCaptchaV2Task",
+                    "websiteURL": "https://paws.community/app?tab=claim",
+                    "websiteKey": "6Lda_s0qAAAAAItgCSBeQN_DVlM9YOk9MccqMG6_",
+                    "enterprisePayload": {
+                        "s": ""  # Enterprise payload if needed
+                    },
+                    "proxy": f"http://{self.proxy_username}:{self.proxy_password}@{self.proxy_host}:{self.proxy_port}"
+                }
+            }
+
+            async with aiohttp.ClientSession() as session:
+                # Create task
+                create_task_response = await session.post(
+                    f"{CAPSOLVER_API_ENDPOINT}/createTask",
+                    json=task_payload
+                )
+                create_task_data = await create_task_response.json()
+
+                if create_task_data.get("errorId") != 0:
+                    logger.error(self.log_message(f"Failed to create captcha task: {create_task_data.get('errorDescription')}"))
                     return {}
-                    
-                loop = asyncio.get_running_loop()
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    result = await loop.run_in_executor(
-                        pool,
-                        lambda: solver.recaptcha(
-                            sitekey="6Lda_s0qAAAAAItgCSBeQN_DVlM9YOk9MccqMG6_",
-                            url="https://paws.community/app?tab=claim",
-                            version='v2',
-                            enterprise=1,
-                            userAgent=self.headers['user-agent'],
-                            action="submit",
-                            softId=4801,
-                            proxyType='HTTP',
-                            proxyAddress=self.proxy_host,
-                            proxyPort=self.proxy_port,
-                            proxyLogin=self.proxy_username,
-                            proxyPassword=self.proxy_password
-                        )
+
+                task_id = create_task_data.get("taskId")
+                
+                # Get task result
+                for _ in range(30):  # Maximum 30 attempts
+                    get_result_response = await session.post(
+                        f"{CAPSOLVER_API_ENDPOINT}/getTaskResult",
+                        json={
+                            "clientKey": self.capsolver_api_key,
+                            "taskId": task_id
+                        }
                     )
-                    return result
-            except Exception as e:
-                logger.warning(self.log_message(f'Failed to solve captcha. Retrying {e}'))
-                await asyncio.sleep(uniform(5, 10))
-                if i == 4:  # Last retry
-                    return {}
-                continue
+                    result_data = await get_result_response.json()
+
+                    if result_data.get("status") == "ready":
+                        return {"code": result_data.get("solution", {}).get("gRecaptchaResponse")}
+                    
+                    await asyncio.sleep(2)
+
+                logger.error(self.log_message("Captcha solving timeout"))
+                return {}
+
+        except Exception as e:
+            logger.error(self.log_message(f"Error solving captcha: {e}"))
+            return {}
 
     async def try_login(self, session: aiohttp.ClientSession, query_id: str) -> tuple[bool, Optional[str]]:
         """Attempt a single login request"""
@@ -240,16 +256,22 @@ class PawsService:
                     return False
 
                 result = await response.json()
-                if not (result.get('success') and result.get('data')):
-                    logger.error(self.log_message(f"Activity check failed. Server response: {result}"))
-                    if attempt < self.max_retries - 1:
-                        logger.info(self.log_message(f"Retrying due to invalid response (attempt {attempt + 1}/{self.max_retries})"))
-                        await asyncio.sleep(uniform(3, 7))
-                        continue
-                    return False
-                    
-                logger.info(self.log_message("✅ Activity check completed successfully"))
-                return True
+                
+                # If success is True and data is False, it means activity was already completed
+                if result.get('success'):
+                    if not result.get('data'):
+                        logger.info(self.log_message("✅ Activity was already completed previously"))
+                    else:
+                        logger.info(self.log_message("✅ Activity check completed successfully"))
+                    return True
+                
+                # If we got here, something went wrong
+                logger.error(self.log_message(f"Activity check failed. Server response: {result}"))
+                if attempt < self.max_retries - 1:
+                    logger.info(self.log_message(f"Retrying due to invalid response (attempt {attempt + 1}/{self.max_retries})"))
+                    await asyncio.sleep(uniform(3, 7))
+                    continue
+                return False
 
             except Exception as e:
                 if self.is_retryable_error(e):
@@ -273,7 +295,7 @@ def load_proxies() -> List[str]:
         logger.error(f"Error loading proxies: {str(e)}")
         return []
 
-async def process_account(session_name: str, query_id: str, captcha_api_key: str, proxy: str):
+async def process_account(session_name: str, query_id: str, capsolver_api_key: str, proxy: str):
     timeout = aiohttp.ClientTimeout(total=60)
     
     # Create ClientSession with proxy configuration
@@ -281,7 +303,7 @@ async def process_account(session_name: str, query_id: str, captcha_api_key: str
     session = aiohttp.ClientSession(timeout=timeout, connector=connector)
     
     try:
-        paws = PawsService(session_name, captcha_api_key, proxy)
+        paws = PawsService(session_name, capsolver_api_key, proxy)
         logger.info(f"\nProcessing Account: {session_name}")
         logger.info(f"Using proxy: {proxy}")
         logger.info("-" * 30)
@@ -303,19 +325,19 @@ async def process_account(session_name: str, query_id: str, captcha_api_key: str
     finally:
         await session.close()
 
-async def process_accounts_chunk(accounts: List[tuple], captcha_api_key: str, proxies: List[str]):
+async def process_accounts_chunk(accounts: List[tuple], capsolver_api_key: str, proxies: List[str]):
     tasks = []
     for session_name, query_id in accounts:
         proxy = choice(proxies)
-        tasks.append(process_account(session_name, query_id, captcha_api_key, proxy))
+        tasks.append(process_account(session_name, query_id, capsolver_api_key, proxy))
     await asyncio.gather(*tasks)
 
 async def main():
     try:
-        # Get 2captcha API key
-        captcha_api_key = os.getenv('TWOCAPTCHA_API_KEY')
-        if not captcha_api_key:
-            captcha_api_key = input("Enter your 2captcha API key: ")
+        # Get Capsolver API key
+        capsolver_api_key = os.getenv('CAPSOLVER_API_KEY')
+        if not capsolver_api_key:
+            capsolver_api_key = input("Enter your Capsolver API key: ")
 
         # Load proxies
         proxies = load_proxies()
@@ -330,14 +352,14 @@ async def main():
         logger.info(f"Loaded {len(query_ids)} accounts and {len(proxies)} proxies")
 
         # Prepare account chunks for parallel processing
-        chunk_size = 10  # Process 5 accounts simultaneously
+        chunk_size = 10  # Process 10 accounts simultaneously
         accounts = [(f"Account_{i}", query_id) for i, query_id in enumerate(query_ids, 1)]
         chunks = [accounts[i:i + chunk_size] for i in range(0, len(accounts), chunk_size)]
 
         # Process chunks of accounts in parallel
         for chunk_num, chunk in enumerate(chunks, 1):
             logger.info(f"\nProcessing chunk {chunk_num}/{len(chunks)} ({len(chunk)} accounts)")
-            await process_accounts_chunk(chunk, captcha_api_key, proxies)
+            await process_accounts_chunk(chunk, capsolver_api_key, proxies)
             
             # Add delay between chunks
             if chunk != chunks[-1]:
